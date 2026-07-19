@@ -87,19 +87,29 @@ def _strip_marker_from_question(q_data: dict, img_id: str) -> None:
 
 
 def _rewrite_marker_url(q_data: dict, img_id: str, url: str) -> None:
-    """Point every ![img_id...](...) marker at the hosted URL -- in
-    question_text AND in every option's option_text."""
+    """
+    Replace every ![img_id...](...) marker with a plain placeholder phrase
+    (no URL) -- in question_text AND in every option's option_text.
+
+    DESIGN DECISION (confirmed with team): the frontend renders images ONLY
+    from the structured `question_image` array, never by markdown-parsing
+    question_text. Leaving a resolved ![id](url) marker inside question_text
+    was causing the SAME image to render twice -- once from question_image,
+    once from an inline markdown parse of question_text. So instead of
+    embedding the URL inline, we now strip the marker down to a neutral
+    placeholder and rely entirely on question_image for rendering.
+    """
     pat = re.compile(r"!\[" + re.escape(img_id) + r"[^\]]*\]\([^)]*\)")
-    repl = f"![{img_id}]({url})"
+    placeholder = "(see figure)"
 
     def clean(entry: dict):
         t = entry.get("question_text")
         if isinstance(t, str) and img_id in t:
-            entry["question_text"] = pat.sub(repl, t)
+            entry["question_text"] = pat.sub(placeholder, t)
         for opt in entry.get("options") or []:
             ot = opt.get("option_text")
             if isinstance(ot, str) and img_id in ot:
-                opt["option_text"] = pat.sub(repl, ot)
+                opt["option_text"] = pat.sub(placeholder, ot)
 
     clean(q_data)
     for alt in q_data.get("additional_questions", []) or []:
@@ -155,13 +165,20 @@ def fill_image_urls(data: dict, image_url_mapping: dict) -> dict:
     for q in all_questions:
         q_data = q.get("question_data", {}) or {}
         entries = []
+        # BUGFIX: "seen" must be shared ACROSS both scopes, not reset per
+        # scope. A root question and its own ALTERNATIVE/child often
+        # reference the SAME shared diagram (e.g. "the figure below" used by
+        # both option A and its OR-alternative) — with a per-scope "seen"
+        # set, that one image id passed the dedupe check twice (once in each
+        # scope) and got appended to `entries` twice, producing a duplicate
+        # image within a single question's own question_image array.
+        seen = set()
         for scope_key, texts in (
             ("question_image", _root_scope_texts(q_data)),
             ("child_additional_questions", _alt_scope_texts(q_data)),
         ):
             joined = " ".join(texts)
             found = _IMG_FULL_RE.findall(joined) or _IMG_ID_RE.findall(joined)
-            seen = set()
             for img_id in found:
                 if img_id in seen:
                     continue
@@ -381,68 +398,6 @@ def reconcile_sub_questions_marks(q: dict) -> bool:
     return changed
 
 
-def reconcile_marking_scheme(marks_target: float, answer_obj: dict) -> bool:
-    if not answer_obj or "marking_scheme" not in answer_obj:
-        return False
-    scheme = answer_obj.get("marking_scheme") or []
-    if not scheme:
-        return False
-
-    total_current = sum(item.get("marks", 0) for item in scheme)
-    if round(total_current, 2) == round(marks_target, 2):
-        return False
-
-    if total_current <= 0:
-        n = len(scheme)
-        for item in scheme:
-            item["marks"] = round(marks_target / n, 1)
-    else:
-        scale = marks_target / total_current
-        for item in scheme:
-            item["marks"] = round(item.get("marks", 0) * scale, 2)
-
-    drift = round(marks_target - sum(item.get("marks", 0) for item in scheme), 2)
-    if drift and scheme:
-        scheme[-1]["marks"] = round(scheme[-1].get("marks", 0) + drift, 2)
-    return True
-
-
-def recursive_marking_scheme_reconcile(
-    q_type: str, q_marks: float, q_data: dict, a_data: dict
-) -> bool:
-    repaired = False
-
-    if q_type in ("VSA", "SA", "LA", "SUBJECTIVE") and "marking_scheme" in a_data:
-        if reconcile_marking_scheme(q_marks, a_data):
-            repaired = True
-
-    add_qs = q_data.get("additional_questions") or []
-    add_as = a_data.get("additional_answers") or []
-    ans_by_prefix = {str(ans.get("answer_prefix", "")): ans for ans in add_as}
-    for sub_q in add_qs:
-        prefix = str(sub_q.get("question_prefix", ""))
-        sub_a = ans_by_prefix.get(prefix)
-        if sub_a:
-            if recursive_marking_scheme_reconcile(
-                sub_q.get("question_type"), sub_q.get("marks", 0), sub_q, sub_a
-            ):
-                repaired = True
-
-    child_qs = q_data.get("child_additional_questions") or []
-    child_as = a_data.get("child_additional_answers") or []
-    child_ans_by_prefix = {str(ans.get("answer_prefix", "")): ans for ans in child_as}
-    for child_q in child_qs:
-        prefix = str(child_q.get("question_prefix", ""))
-        child_a = child_ans_by_prefix.get(prefix)
-        if child_a:
-            if recursive_marking_scheme_reconcile(
-                child_q.get("question_type"), child_q.get("marks", 0), child_q, child_a
-            ):
-                repaired = True
-
-    return repaired
-
-
 def strip_hallucinated_top_level_keys(q: dict) -> bool:
     """
     Phase 2 occasionally invents a top-level key that isn't part of the
@@ -653,11 +608,6 @@ def auto_repair(data: dict, config: dict = None) -> tuple:
             root_alt_findings = flag_root_alternative_marks_mismatch(q)
             for finding in root_alt_findings:
                 fixes.append(f"[{sec_name} Q{q_num}] WARNING: {finding}")
-
-            if recursive_marking_scheme_reconcile(
-                q.get("question_type"), q.get("marks", 0), q_data, a_data
-            ):
-                fixes.append(f"[{sec_name} Q{q_num}] Synchronized marking schemes to match question marks.")
 
             a_data = q.get("answer_data", {})
             if isinstance(a_data, dict):
